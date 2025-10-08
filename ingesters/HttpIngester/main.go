@@ -18,7 +18,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"time"
 
 	// Embed tzdata so that we don't rely on potentially broken timezone DBs on the host
@@ -108,18 +107,8 @@ func main() {
 		lg.FatalCode(0, "Failed to create new handler")
 	}
 
-	if hcurl, ok := cfg.HealthCheck(); ok {
-		hnd.healthCheckURL = path.Clean(hcurl)
-	}
-	if err = includeStdListeners(hnd, igst, cfg, lg); err != nil {
-		lg.Fatal("failed ot include std listeners", log.KVErr(err))
-	}
-
-	if err = includeHecListeners(hnd, igst, cfg, lg); err != nil {
-		lg.Fatal("failed to include HEC Listeners", log.KVErr(err))
-	}
-	if err = includeAFHListeners(hnd, igst, cfg, lg); err != nil {
-		lg.Fatal("failed to include Amazon Firehose Listeners", log.KVErr(err))
+	if err = hnd.loadConfig(cfg); err != nil {
+		lg.Fatal("failed to load configuration", log.KVErr(err))
 	}
 	var httpLogger *dlog.Logger
 	if debugOn || cfg.LogLevel() == `INFO` {
@@ -164,16 +153,43 @@ func main() {
 		debugout("Binding to %v HTTP mode\n", cfg.Bind)
 	}
 
+	var confWatcher base.ConfigWatcher
+
+	if cfg.Enable_Hot_Reload {
+		confWatcher, err = ib.GetConfigChangeNotifier()
+		if err != nil {
+			// just log that we couldn't watch for configuration changes, do not fail the ingester
+			lg.Error("failed to enable configuration change watcher", log.KVErr(err))
+		} else {
+			defer confWatcher.Close()
+		}
+	}
+
 	qc := utils.GetQuitChannel()
 	defer close(qc)
-	select {
-	case <-done:
-	case <-qc:
-		ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
-		if err := srv.Shutdown(ctx); err != nil {
-			lg.Error("failed to serve HTTP server", log.KVErr(err))
+watchExitLoop:
+	for {
+		select {
+		case <-done:
+		case <-confWatcher.Signal():
+			var newCfg *cfgType
+			if err = ib.ReloadConfig(&newCfg); err != nil {
+				lg.Error("failed to parse new configuration", log.KVErr(err))
+			} else if err = hnd.hotReload(newCfg); err != nil {
+				lg.Error("failed to load new configuration", log.KVErr(err))
+			} else {
+				lg.Info("loaded new config")
+			}
+			continue watchExitLoop // keep looping
+		case <-qc:
+			ctx, cf := context.WithTimeout(context.Background(), 60*time.Second)
+			if err := srv.Shutdown(ctx); err != nil {
+				lg.Error("failed to serve HTTP server", log.KVErr(err))
+			}
+			cf()
 		}
-		cf()
+		// default behavior is to exit
+		break watchExitLoop
 	}
 	debugout("Server is exiting\n")
 	ib.AnnounceShutdown()
@@ -290,7 +306,7 @@ func (is *instrumentListener) Accept() (net.Conn, error) {
 	return c, err
 }
 
-func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType, lgr *log.Logger) (err error) {
+func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType) (err error) {
 	for _, v := range cfg.Listener {
 		hcfg := routeHandler{
 			handler:       handleSingle,
@@ -299,8 +315,8 @@ func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType, l
 		if v.Multiline {
 			hcfg.handler = handleMulti
 		}
-		if hcfg.tag, err = igst.GetTag(v.Tag_Name); err != nil {
-			lg.Fatal("failed to pull tag", log.KV("tag", v.Tag_Name), log.KVErr(err))
+		if hcfg.tag, err = igst.NegotiateTag(v.Tag_Name); err != nil {
+			return fmt.Errorf("failed to negotiate tag %s %w", v.Tag_Name, err)
 		}
 		if v.Ignore_Timestamps {
 			hcfg.ignoreTs = true
@@ -308,20 +324,20 @@ func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType, l
 			var window timegrinder.TimestampWindow
 			window, err = cfg.GlobalTimestampWindow()
 			if err != nil {
-				lg.Fatal("Failed to get global timestamp window", log.KVErr(err))
+				return fmt.Errorf("failed to get global timestamp window %w", err)
 			}
 			tcfg := timegrinder.Config{
 				EnableLeftMostSeed: true,
 				TSWindow:           window,
 			}
 			if hcfg.tg, err = timegrinder.NewTimeGrinder(tcfg); err != nil {
-				lg.Fatal("failed to generate new timegrinder", log.KVErr(err))
+				return fmt.Errorf("failed to generate new timegrinder %w", err)
 			} else if err = cfg.TimeFormat.LoadFormats(hcfg.tg); err != nil {
-				lg.Fatal("failed to load custom time formats", log.KVErr(err))
+				return fmt.Errorf("failed to load custom time formats %w", err)
 			}
 			if v.Timestamp_Format_Override != `` {
 				if err = hcfg.tg.SetFormatOverride(v.Timestamp_Format_Override); err != nil {
-					lg.Fatal("Failed to set override timestamp", log.KVErr(err))
+					return fmt.Errorf("failed to set override timestamp %w", err)
 				}
 			}
 			if v.Assume_Local_Timezone {
@@ -329,7 +345,7 @@ func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType, l
 			}
 			if v.Timezone_Override != `` {
 				if err = hcfg.tg.SetTimezone(v.Timezone_Override); err != nil {
-					lg.Fatal("failed to override timezone", log.KVErr(err))
+					return fmt.Errorf("failed to override timezone %w", err)
 				}
 			}
 		}
@@ -339,21 +355,21 @@ func includeStdListeners(hnd *handler, igst *ingest.IngestMuxer, cfg *cfgType, l
 
 		hcfg.pproc, err = cfg.Preprocessor.ProcessorSet(igst, v.Preprocessor)
 		if err != nil {
-			lg.Fatal("preprocessor construction error", log.KVErr(err))
+			return fmt.Errorf("preprocessor construction error %w", err)
 		}
 		//check if authentication is enabled for this URL
 		if pth, ah, err := v.NewAuthHandler(lg); err != nil {
-			lg.Fatal("failed to get a new authentication handler", log.KVErr(err))
+			return fmt.Errorf("failed to get a new authentication handler %w", err)
 		} else if hnd != nil {
 			if pth != `` {
 				if err = hnd.addAuthHandler(http.MethodPost, pth, ah); err != nil {
-					lg.Fatal("failed to add auth handler", log.KV("url", pth), log.KVErr(err))
+					return fmt.Errorf("failed to add auth handler url %q %w", pth, err)
 				}
 			}
 			hcfg.auth = ah
 		}
 		if err = hnd.addHandler(v.Method, v.URL, hcfg); err != nil {
-			lg.Fatal("failed to add handler", log.KV("url", v.URL), log.KVErr(err))
+			return fmt.Errorf("failed to add handler url %q %w", v.URL, err)
 		}
 		debugout("URL %s handling %s\n", v.URL, v.Tag_Name)
 	}
