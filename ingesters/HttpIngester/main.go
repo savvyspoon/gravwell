@@ -153,16 +153,10 @@ func main() {
 		debugout("Binding to %v HTTP mode\n", cfg.Bind)
 	}
 
-	var confWatcher base.ConfigWatcher
+	var confReloadSignal chan os.Signal
 
 	if cfg.Enable_Hot_Reload {
-		confWatcher, err = ib.GetConfigChangeNotifier()
-		if err != nil {
-			// just log that we couldn't watch for configuration changes, do not fail the ingester
-			lg.Error("failed to enable configuration change watcher", log.KVErr(err))
-		} else {
-			defer confWatcher.Close()
-		}
+		confReloadSignal = utils.GetSighupChannel()
 	}
 
 	qc := utils.GetQuitChannel()
@@ -171,7 +165,7 @@ watchExitLoop:
 	for {
 		select {
 		case <-done:
-		case <-confWatcher.Signal():
+		case <-confReloadSignal:
 			var newCfg *cfgType
 			if err = ib.ReloadConfig(&newCfg); err != nil {
 				lg.Error("failed to parse new configuration", log.KVErr(err))
