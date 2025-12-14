@@ -22,32 +22,32 @@ const (
 )
 
 type RegexDropConfig struct {
-	Regex  string
-	Invert bool
+	Regex  string // Regex is the regular expression to match against
+	Invert bool   // Invert negates the match, if true entries that match are kept
 }
 
+// RegexDropLoadConfig loads the configuration for the regexdrop processor
 func RegexDropLoadConfig(vc *config.VariableConfig) (c RegexDropConfig, err error) {
 	if err = vc.MapTo(&c); err != nil {
 		return
 	}
-	return c, c.validate()
+	_, err = c.validate()
+	return
 }
 
-func (c *RegexDropConfig) validate() error {
+func (c *RegexDropConfig) validate() (rx *regexp.Regexp, err error) {
 	if len(c.Regex) == 0 {
-		return errors.New("Regex is required")
-	}
-	if _, err := regexp.Compile(c.Regex); err != nil {
-		return fmt.Errorf("invalid regex: %w", err)
-	}
-	return nil
-}
-
-func NewRegexDropper(cfg RegexDropConfig) (*RegexDropper, error) {
-	if len(cfg.Regex) == 0 {
 		return nil, errors.New("Regex is required")
 	}
-	rx, err := regexp.Compile(cfg.Regex)
+	if rx, err = regexp.Compile(c.Regex); err != nil {
+		return nil, fmt.Errorf("invalid regex: %w", err)
+	}
+	return
+}
+
+// NewRegexDropper creates a new regexdrop processor
+func NewRegexDropper(cfg RegexDropConfig) (*RegexDropper, error) {
+	rx, err := cfg.validate()
 	if err != nil {
 		return nil, err
 	}
@@ -63,15 +63,13 @@ type RegexDropper struct {
 	rx *regexp.Regexp
 }
 
+// Config updates the configuration for the regexdrop processor
 func (r *RegexDropper) Config(v interface{}) (err error) {
 	if v == nil {
 		err = ErrNilConfig
 	} else if cfg, ok := v.(RegexDropConfig); ok {
-		if len(cfg.Regex) == 0 {
-			return errors.New("Regex is required")
-		}
-		if r.rx, err = regexp.Compile(cfg.Regex); err != nil {
-			return err
+		if r.rx, err = cfg.validate(); err != nil {
+			return
 		}
 		r.RegexDropConfig = cfg
 	} else {
